@@ -52,12 +52,18 @@ def main(args):
     model = build_model(in_channels=args.in_channels, height=args.img_size, width=args.img_size).to(device)
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    best_val_acc = 0
 
     for epoch in range(args.epochs):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         print(f"Epoch {epoch+1}/{args.epochs} | Train Acc: {tr_acc:.4f} | Val Acc: {val_acc:.4f}")
 
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), os.path.join(args.outdir, "best_model.pt"))
+        print("✅ Saved best model")
+        
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=30)
