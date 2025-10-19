@@ -1,4 +1,3 @@
-# dataset.py
 import os, random
 import torch
 from torch.utils.data import DataLoader
@@ -34,7 +33,7 @@ def get_loaders(data_root="ADNI/AD_NC", img_size=224, batch_size=32, num_workers
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)
-    # 先用 test 做占位的 val，后续会替换
+
     val_loader   = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
                               num_workers=num_workers, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
