@@ -102,6 +102,18 @@ def main(args):
         
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", type=str, default="ADNI/AD_NC")
+    ap.add_argument("--outdir", type=str, default="runs/adni_resnet")
+    ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-5)
+    ap.add_argument("--in_channels", type=int, default=1, help="ADNI 多为灰度：1")
+    ap.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18","resnet50"])
+    ap.add_argument("--no_pretrain", action="store_true")
+    ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     main(args)
