@@ -5,6 +5,7 @@ from dataset import get_loaders
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 def train_one_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
@@ -37,6 +38,16 @@ def evaluate(model, loader, criterion, device):
     auc = roc_auc_score(y_true, y_prob)
     return total_loss / len(loader.dataset), acc, auc
 
+def plot_curves(history, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    plt.figure()
+    plt.plot(history["train_loss"], label="train_loss")
+    plt.plot(history["val_loss"], label="val_loss")
+    plt.xlabel("epoch"); plt.ylabel("loss")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "loss_curve.png"))
+    plt.close()
+    
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
