@@ -70,3 +70,6 @@ class GFNetBinary(nn.Module):
             x = b(x)
         out = self.head(x)
         return out
+def build_model(in_channels=1, num_classes=2, height=224, width=224):
+    return GFNetBinary(height=height, width=width,
+                       in_channels=in_channels, num_classes=num_classes)
