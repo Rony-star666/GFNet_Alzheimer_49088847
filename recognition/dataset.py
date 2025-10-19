@@ -9,7 +9,14 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 def get_transforms(img_size=224, gray=True, aug=True):
-    t = [transforms.Resize((img_size, img_size)), transforms.ToTensor()]
+    t = [transforms.Resize((img_size, img_size))]
+    if aug:
+        t += [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomRotation(15),
+        ]
+    t.append(transforms.ToTensor())
     if gray:
         t.append(transforms.Normalize(mean=[0.5], std=[0.5]))
         return transforms.Compose([transforms.Grayscale(num_output_channels=1)] + t)
@@ -25,7 +32,7 @@ def get_loaders(data_root="ADNI/AD_NC", img_size=224, batch_size=32, num_workers
     assert os.path.isdir(train_dir), f"Not found: {train_dir}"
     assert os.path.isdir(test_dir),  f"Not found: {test_dir}"
 
-    tf_train = get_transforms(img_size, gray=gray, aug=False)
+    tf_train = get_transforms(img_size, gray=gray, aug=True)
     tf_eval  = get_transforms(img_size, gray=gray, aug=False)
 
     train_ds = datasets.ImageFolder(train_dir, transform=tf_train)
