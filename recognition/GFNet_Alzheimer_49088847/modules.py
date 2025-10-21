@@ -28,7 +28,7 @@ class GFBlock(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, channels),
         )
-        # 改成对最后一维 (C) 归一化
+    
         self.norm1 = nn.LayerNorm(channels)
         self.norm2 = nn.LayerNorm(channels)
 
@@ -51,9 +51,9 @@ class GFNetBinary(nn.Module):
         super().__init__()
         self.height = height
         self.width = width
-        # 首层映射：输入通道 -> channels
+  
         self.proj = nn.Conv2d(in_channels, channels, kernel_size=1)
-        # 若大小不一致可以加 Positional Embedding 或层次缩放（这里简化不做）
+
         self.blocks = nn.ModuleList([
             GFBlock(height, width, channels) for _ in range(depth)
         ])
