@@ -41,22 +41,72 @@ def evaluate(model, loader, criterion, device):
     auc = roc_auc_score(y_true, y_prob)
     return total_loss / len(loader.dataset), acc, auc
 
-def plot_curves(history, outdir):
+def plot_curves(history, outdir, lrs=None):
+   
     os.makedirs(outdir, exist_ok=True)
+
+    # ---- 1️⃣ Loss ----
     plt.figure()
-    plt.plot(history["train_loss"], label="train_loss")
-    plt.plot(history["val_loss"], label="val_loss")
-    plt.xlabel("epoch"); plt.ylabel("loss")
-    plt.legend(); plt.tight_layout()
+    plt.plot(history["train_loss"], label="Train Loss")
+    plt.plot(history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("Training and Validation Loss")
+    plt.tight_layout()
     plt.savefig(os.path.join(outdir, "loss_curve.png"))
     plt.close()
+
+    # ---- 2️⃣ Accuracy ----
+    plt.figure()
+    plt.plot(history["train_acc"], label="Train Acc")
+    plt.plot(history["val_acc"], label="Val Acc")
+    if "test_acc" in history:
+        plt.plot(history["test_acc"], label="Test Acc", linestyle="--")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.title("Accuracy Curve")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "acc_curve.png"))
+    plt.close()
+
+    # ---- 3️⃣ AUC ----
+    plt.figure()
+    plt.plot(history["val_auc"], label="Val AUC")
+    if "test_auc" in history:
+        plt.plot(history["test_auc"], label="Test AUC", linestyle="--")
+    plt.xlabel("Epoch")
+    plt.ylabel("AUC")
+    plt.legend()
+    plt.title("AUC Curve")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "auc_curve.png"))
+    plt.close()
+
+    # ---- 4️⃣ Learning Rate ----
+    if lrs is not None:
+        plt.figure()
+        plt.plot(lrs, label="Learning Rate", color="purple")
+        plt.xlabel("Epoch")
+        plt.ylabel("LR")
+        plt.legend()
+        plt.title("Learning Rate Schedule")
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "lr_curve.png"))
+        plt.close()
+
+    # ---- 5️⃣ 保存历史数据 ----
+    import json
+    with open(os.path.join(outdir, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
     
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     set_seed(args.seed)
-    # 数据加载
     train_loader, val_loader, test_loader, class_names = get_loaders(
         data_root=args.data_root,
         img_size=args.img_size,
@@ -65,7 +115,7 @@ def main(args):
         gray=(args.in_channels == 1)
     )
 
-    # 模型、损失、优化器
+ 
     model = build_model(in_channels=args.in_channels, height=args.img_size, width=args.img_size)
 
 
@@ -79,27 +129,27 @@ def main(args):
     for epoch in range(args.epochs):
         print(f"\nEpoch [{epoch+1}/{args.epochs}]")
 
-        # ---- 训练 ----
+  
         tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         print(f"Train Loss: {tr_loss:.4f}, Train Acc: {tr_acc:.4f}")
 
-        # ---- 验证 ----
+
         val_loss, val_acc, val_auc = evaluate(model, val_loader, criterion, device)
 
         print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val AUC: {val_auc:.4f}")
 
-        # ---- 测试集即时评估 ----
+
         test_loss, test_acc, test_auc = evaluate(model, test_loader, criterion, device)
         print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
 
 
-        # ---- 保存最优模型 ----
+    
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), os.path.join(args.outdir, "best_model.pt"))
             print("✅ Saved best model")
 
-    # ---- 测试集评估 ----
+
     test_loss, test_acc, test_auc = evaluate(model, test_loader, criterion, device)
     print(f"\nTest Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
         
