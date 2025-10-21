@@ -1,7 +1,10 @@
+import os
 import torch
+import torch.nn as nn
 import argparse
 from modules import build_model
-from dataset import get_loaders
+from dataset import get_loaders 
+from dataset import set_seed
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import accuracy_score, roc_auc_score
 from tqdm import tqdm
@@ -52,7 +55,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else
                           "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
-
+    set_seed(args.seed)
     # 数据加载
     train_loader, val_loader, test_loader, class_names = get_loaders(
         data_root=args.data_root,
