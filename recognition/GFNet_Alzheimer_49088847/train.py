@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from copy import deepcopy
 from collections import Counter, defaultdict
-
+from sklearn.metrics import roc_curve
 from sklearn.metrics import accuracy_score, roc_auc_score, balanced_accuracy_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -14,6 +14,8 @@ from torch.amp import autocast, GradScaler
 from modules import build_model
 from dataset import get_loaders, set_seed
 
+metric_for_search = "bal_acc"  
+target_tpr = 0.7          
 
 # ----------------- Temperature Scaling -----------------
 class _TempScale(nn.Module):
@@ -76,10 +78,10 @@ class AutoTuner:
         self.ls_bounds = ls_bounds
         self.dp_bounds = dp_bounds
 
-        self.best_val = -1.0       # ✅ 用成员变量
+        self.best_val = -1.0    
         self.bad_epochs = 0
 
-        self.bad_epochs = 0
+        
 
     def _set_weight_decay(self, new_wd):
         new_wd = float(min(max(new_wd, self.wd_bounds[0]), self.wd_bounds[1]))
@@ -115,7 +117,7 @@ class AutoTuner:
         return sum(ps)/len(ps) if ps else 0.0
 
     def step(self, tr_acc, val_acc, val_auc, improve, tf_train=None):
-        # 这里的 improve 由调用方决定（本脚本用 val_acc 判断）
+      
         if improve:
             self.best_val = max(self.best_val, val_auc)
             self.bad_epochs = 0
@@ -127,7 +129,7 @@ class AutoTuner:
         ls = self._get_label_smoothing()
         dp = self._get_dropout()
 
-        # 过拟合：gap 大且无提升 -> 增强正则
+    
         if gap > self.gap_hi and self.bad_epochs >= 1:
             target = wd * 1.5 if wd > 0 else self.wd_bounds[0]
             self._set_weight_decay(target)
@@ -136,7 +138,7 @@ class AutoTuner:
             if self.ema is not None and isinstance(self.ema, dict):
                 self.ema["decay"] = min(0.9999, self.ema["decay"] + 0.0005)
 
-        # 欠拟合：gap 小且 val 低 -> 降正则
+     
         elif gap < self.gap_lo and val_acc < 0.65 and self.bad_epochs >= 2:
             self._set_weight_decay(wd * 0.7)
             self._set_label_smoothing(max(self.ls_bounds[0], ls - 0.01))
@@ -209,15 +211,155 @@ def _extract_subject_id(p):
         return max(m, key=len)  # 取最长数字串
     stem = os.path.splitext(os.path.basename(p))[0]
     return stem.split("_")[0]
+def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric="bal_acc"):
+  
+    thrs = np.linspace(0.0, 1.0, 2001)
+
+    def _tpr_tnr(pred, true):
+        tp = ((pred == 1) & (true == 1)).sum()
+        fn = ((pred == 0) & (true == 1)).sum()
+        tn = ((pred == 0) & (true == 0)).sum()
+        fp = ((pred == 1) & (true == 0)).sum()
+        tpr = tp / max(tp + fn, 1)
+        tnr = tn / max(tn + fp, 1)
+        return float(tpr), float(tnr)
+
+    best_thr, best_metric = 0.5, -1.0
+    cand = []
+    for t in thrs:
+        pred = (sid_probs > t).astype(int)
+        tpr, tnr = _tpr_tnr(pred, sid_true)
+        if metric == "bal_acc":
+            m = 0.5 * (tpr + tnr)
+        elif metric == "youden":
+            m = tpr + tnr - 1.0
+        else:  # "acc"
+            m = accuracy_score(sid_true, pred)
+        cand.append((t, m, tpr))
+
+    if target_tpr is not None:
+        hit = [x for x in cand if x[2] + 1e-12 >= target_tpr]
+        if hit:
+            for t, m, _ in hit:
+                if m > best_metric:
+                    best_metric, best_thr = m, float(t)
+        else:
+            # 退化：在所有阈值里最大化 metric
+            for t, m, _ in cand:
+                if m > best_metric:
+                    best_metric, best_thr = m, float(t)
+    else:
+        for t, m, _ in cand:
+            if m > best_metric:
+                best_metric, best_thr = m, float(t)
+
+    return best_thr
+
+@torch.no_grad()
+def evaluate_subject_level_split(
+    model,
+    loader,
+    criterion,
+    device,
+    threshold=None,
+    search_thresh=False,
+    temp_layer=None,
+    metric_for_search="acc" 
+):
+    
+    model.eval()
+    running_loss, y_true_img, y_prob_img = 0.0, [], []
+
+ 
+    paths_all = _ordered_paths_from_loader(loader)
+    ptr = 0
+    paths_this_epoch = []
+
+    for imgs, labels in loader:
+        bs = imgs.size(0)
+        imgs, labels = imgs.to(device), labels.to(device)
+        logits = _with_temp_forward(model, temp_layer, imgs)
+        loss = criterion(logits, labels)
+        running_loss += loss.detach().item() * bs
+
+
+        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+        y_prob_img.extend(probs.tolist())
+        y_true_img.extend(labels.detach().cpu().numpy().tolist())
+
+        paths_this_epoch.extend(paths_all[ptr:ptr+bs])
+        ptr += bs
+
+    epoch_loss = running_loss / max(len(loader.dataset), 1)
+
+ 
+    prob_by_sid = defaultdict(list)
+    label_by_sid = {}
+    for prob, y, p in zip(y_prob_img, y_true_img, paths_this_epoch):
+        sid = _extract_subject_id(p)
+        prob_by_sid[sid].append(prob)
+        label_by_sid.setdefault(sid, []).append(int(y))
+
+    sid_list = sorted(prob_by_sid.keys())
+    sid_probs = np.array([np.mean(prob_by_sid[s]) for s in sid_list], dtype=np.float32)
+    sid_true  = np.array([int(round(np.mean(label_by_sid[s]))) for s in sid_list], dtype=np.int64)
+
+ 
+    best_thr = 0.5 if threshold is None else float(threshold)
+    if search_thresh:
+     
+        _metric = metric_for_search if metric_for_search is not None else globals().get("metric_for_search", "acc")
+        _target_tpr = globals().get("target_tpr", None)
+        best_thr = _pick_threshold_with_target_tpr(
+            sid_true, sid_probs,
+            target_tpr=_target_tpr,
+            metric=_metric
+        )
+
+
+    sid_pred = (sid_probs > best_thr).astype(int)
+
+    acc_overall = accuracy_score(sid_true, sid_pred)
+    try:
+        auc_overall = roc_auc_score(sid_true, sid_probs)
+    except Exception:
+        auc_overall = 0.0
+
+  
+    mask_AD = (sid_true == 0)
+    mask_NC = (sid_true == 1)
+    AD_n = int(mask_AD.sum())
+    NC_n = int(mask_NC.sum())
+
+    
+    AD_acc = float(((sid_pred == 0) & mask_AD).sum() / AD_n) if AD_n > 0 else float("nan")
+  
+    NC_acc = float(((sid_pred == 1) & mask_NC).sum() / NC_n) if NC_n > 0 else float("nan")
+
+
+    TP = int(((sid_pred == 0) & (sid_true == 0)).sum())  
+    TN = int(((sid_pred == 1) & (sid_true == 1)).sum())  
+    FP = int(((sid_pred == 0) & (sid_true == 1)).sum())  
+    FN = int(((sid_pred == 1) & (sid_true == 0)).sum())  
+
+    per_class = {
+        "AD_n": AD_n, "NC_n": NC_n,
+        "AD_acc": AD_acc, "NC_acc": NC_acc,
+        "TP": TP, "TN": TN, "FP": FP, "FN": FN,
+        "recall_AD": float(TP / (TP + FN)) if (TP + FN) > 0 else float("nan"),
+        "specificity_NC": float(TN / (TN + FP)) if (TN + FP) > 0 else float("nan"),
+    }
+
+    return float(epoch_loss), float(acc_overall), float(auc_overall), float(best_thr), per_class
+
+
 
 @torch.no_grad()
 def evaluate_subject_level(model, loader, criterion, device,
                            threshold=None, search_thresh=False, temp_layer=None):
     model.eval()
     running_loss, y_true_img, y_prob_img = 0.0, [], []
-    metric = "bal_acc"  # 用 balanced accuracy 搜阈值
 
-    # 注意：val/test loader 要 shuffle=False 才能用这个函数
     paths_all = _ordered_paths_from_loader(loader)
     ptr = 0
     paths_this_epoch = []
@@ -238,7 +380,6 @@ def evaluate_subject_level(model, loader, criterion, device,
 
     epoch_loss = running_loss / max(len(loader.dataset), 1)
 
-    # ---- 患者级聚合：用 median 抗噪（也可以换成截尾平均）----
     from statistics import median
     prob_by_sid = defaultdict(list)
     label_by_sid = {}
@@ -252,29 +393,22 @@ def evaluate_subject_level(model, loader, criterion, device,
     sid_probs = np.array([median(prob_by_sid[s]) for s in sid_list], dtype=np.float32)
     sid_true  = np.array([int(round(np.mean(label_by_sid[s]))) for s in sid_list], dtype=np.int64)
 
-    # ---- 阈值 ----
     best_thr = 0.5 if threshold is None else float(threshold)
     if search_thresh:
-        thrs = np.linspace(0.0, 1.0, 201)
-        best_metric = -1.0
-        for t in thrs:
-            pred = (sid_probs > t).astype(int)
-            m = (balanced_accuracy_score(sid_true, pred)
-                 if metric == "bal_acc" else
-                 accuracy_score(sid_true, pred))
-            if m > best_metric:
-                best_metric = m
-                best_thr = float(t)
+        best_thr = _pick_threshold_with_target_tpr(
+            sid_true, sid_probs,
+            target_tpr=target_tpr,     
+            metric=metric_for_search  
+        )
 
-    # 报告的 acc 仍用普通 accuracy，便于与历史曲线对齐
     acc = accuracy_score(sid_true, (sid_probs > best_thr).astype(int))
-
     try:
         auc = roc_auc_score(sid_true, sid_probs)
     except Exception:
         auc = 0.0
 
     return float(epoch_loss), float(acc), float(auc), float(best_thr)
+
 
 
 
@@ -341,7 +475,6 @@ def plot_curves(history, outdir):
 
 
 def _collect_labels(ds):
-    # 兼容 ImageFolder / 自定义
     if hasattr(ds, 'targets'):
         return list(map(int, ds.targets))
     if hasattr(ds, 'samples'):
@@ -472,12 +605,12 @@ def main(args):
         )
 
         # ---- Test（患者级+温度，用 Val 的最佳阈值）----
-        test_loss, test_acc, test_auc, _ = evaluate_subject_level(
+        test_loss, test_acc, test_auc, _, test_split = evaluate_subject_level_split(
             ema_model, test_loader, criterion, device,
             threshold=best_thr_epoch, search_thresh=False, temp_layer=temp_layer
         )
 
-        # 记录
+      
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(tr_acc)
@@ -490,12 +623,17 @@ def main(args):
 
         print(f"Train Loss: {tr_loss:.4f}, Train Acc: {tr_acc:.4f}")
         print(f"Val   Loss: {val_loss:.4f}, Val   Acc: {val_acc:.4f}, Val AUC: {val_auc:.4f}, BestThr: {best_thr_epoch:.3f}")
-        print(f"Test  Loss: {test_loss:.4f}, Test  Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
+        print(f"Test  Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
+        print(f"Per-class Test Acc -> AD: {test_split['AD_acc']:.4f} (n={test_split['AD_n']}), "
+            f"NC: {test_split['NC_acc']:.4f} (n={test_split['NC_n']})")
+        print(f"Confusion (AD positive): TP={test_split['TP']}  FP={test_split['FP']}  "
+            f"TN={test_split['TN']}  FN={test_split['FN']}")
+        print(f"Recall_AD={test_split['recall_AD']:.4f}, Specificity_NC={test_split['specificity_NC']:.4f}")
         print(f"LR after epoch {epoch+1}: {cur_lr:.6f}")
 
-        # AutoTuner（用 AUC 作为提升判断）
+        
         eps = 1e-6
-        improve = (val_auc > best_val_auc + eps)   # ✅ 用 AUC 判是否提升
+        improve = (val_auc > best_val_auc + eps)  
         info = tuner.step(tr_acc, val_acc, val_auc, improve=improve)
 
         history["wd"].append(info["wd"])
@@ -504,9 +642,9 @@ def main(args):
         print(f"[AutoTuner] wd={info['wd']:.2e} ls={info['ls']:.3f} dp={info['dp']:.2f} "
               f"gap={info['gap']:.3f} bad_epochs={info['bad_epochs']} (ema_decay={ema_decay_ref['decay']:.5f})")
 
-        # 保存：按 val_auc 最优
+        
         if val_auc > best_val_auc + eps:
-            best_val_auc = val_auc              # ✅ 更新“最佳 AUC”
+            best_val_auc = val_auc             
             best_thr = best_thr_epoch
             torch.save(
                 {   "model": ema_model.state_dict(),
@@ -525,7 +663,7 @@ def main(args):
     ema_model.load_state_dict(ck["model"])
     best_thr_final = float(ck.get("best_thr", best_thr))
 
-    # 再用验证集拟合一次温度，保持一致性
+    
     temp_layer = fit_temperature(ema_model, val_loader, device)
     for p in temp_layer.parameters():
         p.requires_grad_(False)
