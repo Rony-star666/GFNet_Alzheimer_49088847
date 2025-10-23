@@ -1,4 +1,3 @@
-# train.py
 import os, re, argparse
 import numpy as np
 import torch
@@ -21,7 +20,7 @@ target_tpr = 0.7
 class _TempScale(nn.Module):
     def __init__(self):
         super().__init__()
-        self.logT = nn.Parameter(torch.zeros(1))  # T=1 起步
+        self.logT = nn.Parameter(torch.zeros(1))  # T=1 start
     def forward(self, logits):
         T = torch.exp(self.logT) + 1e-6
         return logits / T
@@ -61,7 +60,7 @@ def _with_temp_forward(model, temp_layer, imgs):
 # ----------------- AutoTuner -----------------
 class AutoTuner:
     """
-    每个 epoch 后，根据 train/val 的差异自适应地做小幅正则化调整。
+    After each epoch, make minor regularization adjustments adaptively based on the differences in train/val.
     """
     def __init__(self, model, optimizer, criterion, ema=None,
                  gap_hi=0.08, gap_lo=0.02, patience=3,
@@ -202,13 +201,13 @@ def _ordered_paths_from_loader(loader):
         for p, _ in ds.samples:
             paths.append(p)
     else:
-        raise RuntimeError("无法从当前 dataset 恢复路径；请确保 val/test 的 DataLoader shuffle=False。")
+        raise RuntimeError("The path cannot be restored from the current dataset. Please ensure that the DataLoader shuffle of val/test =False")
     return paths
 
 def _extract_subject_id(p):
     m = re.findall(r"\d{5,}", p.replace("\\", "/"))
     if m:
-        return max(m, key=len)  # 取最长数字串
+        return max(m, key=len)   
     stem = os.path.splitext(os.path.basename(p))[0]
     return stem.split("_")[0]
 def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric="bal_acc"):
