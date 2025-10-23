@@ -61,7 +61,7 @@ class GFNetBinary(nn.Module):
 
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, channels, 1, bias=False),
-            nn.GroupNorm(8, channels),    # GroupNorm 对小 batch 更稳定
+            nn.GroupNorm(8, channels),    
             nn.GELU(),
             nn.Dropout2d(dropout)
         )
