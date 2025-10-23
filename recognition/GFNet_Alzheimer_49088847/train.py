@@ -1,8 +1,9 @@
-# train.py —— no-EMA & no-Temperature-Scaling
+# train.py  ——  no-EMA version
 import os, re, argparse
 import numpy as np
 import torch
 import torch.nn as nn
+from copy import deepcopy
 from collections import Counter, defaultdict
 from sklearn.metrics import accuracy_score, roc_auc_score
 import matplotlib.pyplot as plt
@@ -13,7 +14,45 @@ from modules import build_model
 from dataset import get_loaders, set_seed
 
 metric_for_search = "bal_acc"   # "acc" | "bal_acc" | "youden"
-target_tpr = 0.7                # 目标召回(针对 NC=1 的 TPR)，不需要就置为 None
+target_tpr = 0.7
+
+# ----------------- Temperature Scaling -----------------
+class _TempScale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.logT = nn.Parameter(torch.zeros(1))
+    def forward(self, logits):
+        T = torch.exp(self.logT) + 1e-6
+        return logits / T
+
+@torch.no_grad()
+def _collect_logits_labels(model, loader, device):
+    model.eval()
+    all_logits, all_labels = [], []
+    for imgs, labels in loader:
+        imgs = imgs.to(device)
+        logits = model(imgs)
+        all_logits.append(logits.cpu())
+        all_labels.append(labels.clone())
+    return torch.cat(all_logits), torch.cat(all_labels)
+
+def fit_temperature(model, val_loader, device):
+    logits, labels = _collect_logits_labels(model, val_loader, device)
+    temp = _TempScale().to(device)
+    logits = logits.to(device); labels = labels.to(device)
+    opt = torch.optim.LBFGS(temp.parameters(), lr=0.1, max_iter=50)
+    ce = nn.CrossEntropyLoss()
+    def closure():
+        opt.zero_grad()
+        loss = ce(temp(logits), labels)
+        loss.backward()
+        return loss
+    opt.step(closure)
+    return temp
+
+def _with_temp_forward(model, temp_layer, imgs):
+    logits = model(imgs)
+    return temp_layer(logits) if temp_layer is not None else logits
 
 
 # ----------------- AutoTuner -----------------
@@ -25,6 +64,7 @@ class AutoTuner:
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
+        self.ema = ema  # 现在不会用到，保持兼容
         self.gap_hi = gap_hi
         self.gap_lo = gap_lo
         self.patience = patience
@@ -78,6 +118,7 @@ class AutoTuner:
             self._set_weight_decay(target)
             self._set_label_smoothing(ls + 0.01)
             self._set_dropout(dp + 0.02)
+
         elif gap < self.gap_lo and val_acc < 0.65 and self.bad_epochs >= 2:
             self._set_weight_decay(wd * 0.7)
             self._set_label_smoothing(max(self.ls_bounds[0], ls - 0.01))
@@ -172,33 +213,32 @@ def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric
 
 @torch.no_grad()
 def evaluate_subject_level_split(model, loader, criterion, device,
-                                 threshold=None, search_thresh=False,
+                                 threshold=None, search_thresh=False, temp_layer=None,
                                  metric_for_search="acc"):
     model.eval()
     running_loss, y_true_img, y_prob_img = 0.0, [], []
     paths_all = _ordered_paths_from_loader(loader)
     ptr = 0
     paths_this_epoch = []
-
     for imgs, labels in loader:
         bs = imgs.size(0)
         imgs, labels = imgs.to(device), labels.to(device)
-        logits = model(imgs)
+        logits = _with_temp_forward(model, temp_layer, imgs)
         loss = criterion(logits, labels)
         running_loss += loss.detach().item() * bs
         probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
         y_prob_img.extend(probs.tolist())
         y_true_img.extend(labels.detach().cpu().numpy().tolist())
-        paths_this_epoch.extend(paths_all[ptr:ptr+bs]); ptr += bs
-
+        paths_this_epoch.extend(paths_all[ptr:ptr+bs])
+        ptr += bs
     epoch_loss = running_loss / max(len(loader.dataset), 1)
 
-    prob_by_sid = defaultdict(list); label_by_sid = {}
+    prob_by_sid = defaultdict(list)
+    label_by_sid = {}
     for prob, y, p in zip(y_prob_img, y_true_img, paths_this_epoch):
         sid = _extract_subject_id(p)
         prob_by_sid[sid].append(prob)
         label_by_sid.setdefault(sid, []).append(int(y))
-
     sid_list = sorted(prob_by_sid.keys())
     sid_probs = np.array([np.mean(prob_by_sid[s]) for s in sid_list], dtype=np.float32)
     sid_true  = np.array([int(round(np.mean(label_by_sid[s]))) for s in sid_list], dtype=np.int64)
@@ -216,7 +256,8 @@ def evaluate_subject_level_split(model, loader, criterion, device,
     except Exception:
         auc_overall = 0.0
 
-    mask_AD = (sid_true == 0); mask_NC = (sid_true == 1)
+    mask_AD = (sid_true == 0)
+    mask_NC = (sid_true == 1)
     AD_n = int(mask_AD.sum()); NC_n = int(mask_NC.sum())
     AD_acc = float(((sid_pred == 0) & mask_AD).sum() / AD_n) if AD_n > 0 else float("nan")
     NC_acc = float(((sid_pred == 1) & mask_NC).sum() / NC_n) if NC_n > 0 else float("nan")
@@ -237,43 +278,41 @@ def evaluate_subject_level_split(model, loader, criterion, device,
 
 @torch.no_grad()
 def evaluate_subject_level(model, loader, criterion, device,
-                           threshold=None, search_thresh=False):
+                           threshold=None, search_thresh=False, temp_layer=None):
     model.eval()
     running_loss, y_true_img, y_prob_img = 0.0, [], []
     paths_all = _ordered_paths_from_loader(loader)
     ptr = 0
     paths_this_epoch = []
-
     for imgs, labels in loader:
         bs = imgs.size(0)
         imgs, labels = imgs.to(device), labels.to(device)
-        logits = model(imgs)
+        logits = _with_temp_forward(model, temp_layer, imgs)
         loss = criterion(logits, labels)
         running_loss += loss.detach().item() * bs
         probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
         y_prob_img.extend(probs.tolist())
         y_true_img.extend(labels.detach().cpu().numpy().tolist())
-        paths_this_epoch.extend(paths_all[ptr:ptr+bs]); ptr += bs
-
+        paths_this_epoch.extend(paths_all[ptr:ptr+bs])
+        ptr += bs
     epoch_loss = running_loss / max(len(loader.dataset), 1)
 
     from statistics import median
-    prob_by_sid = defaultdict(list); label_by_sid = {}
+    prob_by_sid = defaultdict(list)
+    label_by_sid = {}
     for prob, y, p in zip(y_prob_img, y_true_img, paths_this_epoch):
         sid = _extract_subject_id(p)
         prob_by_sid[sid].append(prob)
         label_by_sid.setdefault(sid, []).append(int(y))
-
     sid_list = sorted(prob_by_sid.keys())
     sid_probs = np.array([median(prob_by_sid[s]) for s in sid_list], dtype=np.float32)
     sid_true  = np.array([int(round(np.mean(label_by_sid[s]))) for s in sid_list], dtype=np.int64)
 
     best_thr = 0.5 if threshold is None else float(threshold)
     if search_thresh:
-        best_thr = _pick_threshold_with_target_tpr(
-            sid_true, sid_probs, target_tpr=target_tpr, metric=metric_for_search
-        )
-
+        best_thr = _pick_threshold_with_target_tpr(sid_true, sid_probs,
+                                                   target_tpr=target_tpr,
+                                                   metric=metric_for_search)
     acc = accuracy_score(sid_true, (sid_probs > best_thr).astype(int))
     try:
         auc = roc_auc_score(sid_true, sid_probs)
@@ -329,7 +368,11 @@ def _collect_labels(ds):
     if hasattr(ds, 'targets'):
         return list(map(int, ds.targets))
     if hasattr(ds, 'samples'):
-        return [int(cls) for _, cls in ds.samples]
+        labs = []
+        for s in ds.samples:
+            _, cls = s
+            labs.append(int(cls))
+        return labs
     return None
 
 def set_lr(optimizer, lr):
@@ -345,8 +388,10 @@ def main(args):
     set_seed(args.seed)
 
     train_loader, val_loader, test_loader, class_names = get_loaders(
-        data_root=args.data_root, img_size=args.img_size,
-        batch_size=args.batch_size, num_workers=args.workers,
+        data_root=args.data_root,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
         gray=(args.in_channels == 1)
     )
 
@@ -385,18 +430,22 @@ def main(args):
         import math
         return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t / T))
 
-    tuner = AutoTuner(model=model, optimizer=optimizer, criterion=criterion,
+    tuner = AutoTuner(model=model, optimizer=optimizer, criterion=criterion, ema=None,
                       gap_hi=0.08, gap_lo=0.02, patience=3,
                       wd_bounds=(1e-4, 5e-2), ls_bounds=(0.0, 0.10), dp_bounds=(0.0, 0.4))
     scaler = GradScaler('cuda')
 
     best_val_auc = -1.0
     best_thr = 0.5
-    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": [],
-               "val_auc": [], "test_acc": [], "test_auc": [],
-               "lr": [], "best_thr": [], "wd": [], "ls": [], "dp": []}
+    history = {
+        "train_loss": [], "val_loss": [],
+        "train_acc": [],  "val_acc": [],
+        "val_auc": [], "test_acc": [], "test_auc": [],
+        "lr": [], "best_thr": [], "wd": [], "ls": [], "dp": []
+    }
 
     os.makedirs(args.outdir, exist_ok=True)
+    temp_layer = None
 
     for epoch in range(args.epochs):
         print(f"\nEpoch [{epoch+1}/{args.epochs}]")
@@ -404,12 +453,18 @@ def main(args):
 
         tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
 
+        # 温度标定在 val 上（使用当前模型）
+        if epoch == 0 or (epoch % 5 == 0):
+            temp_layer = fit_temperature(model, val_loader, device)
+            for p in temp_layer.parameters():
+                p.requires_grad_(False)
+
         val_loss, val_acc, val_auc, best_thr_epoch = evaluate_subject_level(
-            model, val_loader, criterion, device, search_thresh=True
+            model, val_loader, criterion, device, search_thresh=True, temp_layer=temp_layer
         )
         test_loss, test_acc, test_auc, _, test_split = evaluate_subject_level_split(
             model, test_loader, criterion, device,
-            threshold=best_thr_epoch, search_thresh=False
+            threshold=best_thr_epoch, search_thresh=False, temp_layer=temp_layer
         )
 
         history["train_loss"].append(tr_loss); history["val_loss"].append(val_loss)
@@ -452,9 +507,13 @@ def main(args):
     model.load_state_dict(ck["model"])
     best_thr_final = float(ck.get("best_thr", best_thr))
 
+    temp_layer = fit_temperature(model, val_loader, device)
+    for p in temp_layer.parameters():
+        p.requires_grad_(False)
+
     test_loss, test_acc, test_auc, _ = evaluate_subject_level(
         model, test_loader, criterion, device,
-        threshold=best_thr_final, search_thresh=False
+        threshold=best_thr_final, search_thresh=False, temp_layer=temp_layer
     )
     print(f"\nFinal Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f} (thr={best_thr_final:.3f})")
 
@@ -464,7 +523,7 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, default="ADNI/AD_NC")
-    ap.add_argument("--outdir", type=str, default="runs/adni_gfnet_notemp")
+    ap.add_argument("--outdir", type=str, default="runs/adni_gfnet_noema")
     ap.add_argument("--img_size", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=16)
