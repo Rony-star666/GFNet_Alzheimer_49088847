@@ -1,4 +1,4 @@
-# train.py —— no-EMA / no-Temp / no-AutoTuner
+# train.py —— no-EMA & no-Temperature-Scaling
 import os, re, argparse
 import numpy as np
 import torch
@@ -12,12 +12,85 @@ from torch.amp import autocast, GradScaler
 from modules import build_model
 from dataset import get_loaders, set_seed
 
-# 阈值搜索的全局设定
 metric_for_search = "bal_acc"   # "acc" | "bal_acc" | "youden"
-target_tpr = 0.7                # 针对类1(NC)的TPR目标；不需要就设为 None
+target_tpr = 0.7                # 目标召回(针对 NC=1 的 TPR)，不需要就置为 None
 
 
-# ----------------- 训练一个epoch -----------------
+# ----------------- AutoTuner -----------------
+class AutoTuner:
+    def __init__(self, model, optimizer, criterion, ema=None,
+                 gap_hi=0.08, gap_lo=0.02, patience=3,
+                 wd_bounds=(1e-4, 5e-2), ls_bounds=(0.0, 0.10),
+                 dp_bounds=(0.0, 0.4)):
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.gap_hi = gap_hi
+        self.gap_lo = gap_lo
+        self.patience = patience
+        self.wd_bounds = wd_bounds
+        self.ls_bounds = ls_bounds
+        self.dp_bounds = dp_bounds
+        self.best_val = -1.0
+        self.bad_epochs = 0
+
+    def _set_weight_decay(self, new_wd):
+        new_wd = float(min(max(new_wd, self.wd_bounds[0]), self.wd_bounds[1]))
+        for g in self.optimizer.param_groups:
+            if g.get("weight_decay", 0.0) > 0:
+                g["weight_decay"] = new_wd
+    def _get_weight_decay(self):
+        for g in self.optimizer.param_groups:
+            if g.get("weight_decay", 0.0) > 0:
+                return g["weight_decay"]
+        return 0.0
+
+    def _set_label_smoothing(self, new_ls):
+        new_ls = float(min(max(new_ls, self.ls_bounds[0]), self.ls_bounds[1]))
+        if hasattr(self.criterion, "label_smoothing"):
+            self.criterion.label_smoothing = new_ls
+    def _get_label_smoothing(self):
+        return getattr(self.criterion, "label_smoothing", 0.0)
+
+    def _set_dropout(self, new_p):
+        new_p = float(min(max(new_p, self.dp_bounds[0]), self.dp_bounds[1]))
+        for m in self.model.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+                m.p = new_p
+    def _get_dropout(self):
+        ps = [m.p for m in self.model.modules() if isinstance(m, (nn.Dropout, nn.Dropout2d))]
+        return sum(ps)/len(ps) if ps else 0.0
+
+    def step(self, tr_acc, val_acc, val_auc, improve, tf_train=None):
+        if improve:
+            self.best_val = max(self.best_val, val_auc)
+            self.bad_epochs = 0
+        else:
+            self.bad_epochs += 1
+
+        gap = float(tr_acc - val_acc)
+        wd = self._get_weight_decay()
+        ls = self._get_label_smoothing()
+        dp = self._get_dropout()
+
+        if gap > self.gap_hi and self.bad_epochs >= 1:
+            target = wd * 1.5 if wd > 0 else self.wd_bounds[0]
+            self._set_weight_decay(target)
+            self._set_label_smoothing(ls + 0.01)
+            self._set_dropout(dp + 0.02)
+        elif gap < self.gap_lo and val_acc < 0.65 and self.bad_epochs >= 2:
+            self._set_weight_decay(wd * 0.7)
+            self._set_label_smoothing(max(self.ls_bounds[0], ls - 0.01))
+            self._set_dropout(max(self.dp_bounds[0], dp - 0.02))
+
+        return {"wd": self._get_weight_decay(),
+                "ls": self._get_label_smoothing(),
+                "dp": self._get_dropout(),
+                "bad_epochs": self.bad_epochs,
+                "gap": gap}
+
+
+# ----------------- Train one epoch -----------------
 def train_one_epoch(model, train_loader, criterion, optimizer, device, scaler):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
@@ -31,16 +104,14 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, scaler):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-
         total_loss += loss.detach().item() * imgs.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
-
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
-# ----------------- Subject-level评估工具 -----------------
+# ----------------- Subject-level evaluation -----------------
 def _ordered_paths_from_loader(loader):
     ds = loader.dataset
     paths = []
@@ -57,22 +128,20 @@ def _ordered_paths_from_loader(loader):
 def _extract_subject_id(p):
     m = re.findall(r"\d{5,}", p.replace("\\", "/"))
     if m:
-        return max(m, key=len)  # 最长数字串
+        return max(m, key=len)
     stem = os.path.splitext(os.path.basename(p))[0]
     return stem.split("_")[0]
 
 def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric="bal_acc"):
     thrs = np.linspace(0.0, 1.0, 2001)
-
     def _tpr_tnr(pred, true):
         tp = ((pred == 1) & (true == 1)).sum()
         fn = ((pred == 0) & (true == 1)).sum()
         tn = ((pred == 0) & (true == 0)).sum()
         fp = ((pred == 1) & (true == 0)).sum()
-        tpr = tp / max(tp + fn, 1)  # 类1(NC)的TPR
-        tnr = tn / max(tn + fp, 1)  # 类0(AD)的TNR
+        tpr = tp / max(tp + fn, 1)
+        tnr = tn / max(tn + fp, 1)
         return float(tpr), float(tnr)
-
     best_thr, best_metric = 0.5, -1.0
     cand = []
     for t in thrs:
@@ -82,10 +151,9 @@ def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric
             m = 0.5 * (tpr + tnr)
         elif metric == "youden":
             m = tpr + tnr - 1.0
-        else:  # "acc"
+        else:
             m = accuracy_score(sid_true, pred)
         cand.append((t, m, tpr))
-
     if target_tpr is not None:
         hit = [x for x in cand if x[2] + 1e-12 >= target_tpr]
         if hit:
@@ -102,19 +170,12 @@ def _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=None, metric
                 best_metric, best_thr = m, float(t)
     return best_thr
 
-
 @torch.no_grad()
 def evaluate_subject_level_split(model, loader, criterion, device,
                                  threshold=None, search_thresh=False,
                                  metric_for_search="acc"):
-    """
-    返回: epoch_loss, acc_overall, auc_overall, best_thr, per_class
-    per_class: {AD_n, NC_n, AD_acc, NC_acc, TP, TN, FP, FN, recall_AD, specificity_NC}
-    说明：labels中约定 0=AD, 1=NC；计算概率用 softmax(logits)[:,1] 表示NC的概率。
-    """
     model.eval()
     running_loss, y_true_img, y_prob_img = 0.0, [], []
-
     paths_all = _ordered_paths_from_loader(loader)
     ptr = 0
     paths_this_epoch = []
@@ -125,11 +186,9 @@ def evaluate_subject_level_split(model, loader, criterion, device,
         logits = model(imgs)
         loss = criterion(logits, labels)
         running_loss += loss.detach().item() * bs
-
-        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()  # NC 概率
+        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
         y_prob_img.extend(probs.tolist())
         y_true_img.extend(labels.detach().cpu().numpy().tolist())
-
         paths_this_epoch.extend(paths_all[ptr:ptr+bs]); ptr += bs
 
     epoch_loss = running_loss / max(len(loader.dataset), 1)
@@ -150,7 +209,7 @@ def evaluate_subject_level_split(model, loader, criterion, device,
         _target_tpr = globals().get("target_tpr", None)
         best_thr = _pick_threshold_with_target_tpr(sid_true, sid_probs, target_tpr=_target_tpr, metric=_metric)
 
-    sid_pred = (sid_probs > best_thr).astype(int)  # 1=NC
+    sid_pred = (sid_probs > best_thr).astype(int)
     acc_overall = accuracy_score(sid_true, sid_pred)
     try:
         auc_overall = roc_auc_score(sid_true, sid_probs)
@@ -176,13 +235,11 @@ def evaluate_subject_level_split(model, loader, criterion, device,
     }
     return float(epoch_loss), float(acc_overall), float(auc_overall), float(best_thr), per_class
 
-
 @torch.no_grad()
 def evaluate_subject_level(model, loader, criterion, device,
                            threshold=None, search_thresh=False):
     model.eval()
     running_loss, y_true_img, y_prob_img = 0.0, [], []
-
     paths_all = _ordered_paths_from_loader(loader)
     ptr = 0
     paths_this_epoch = []
@@ -193,11 +250,9 @@ def evaluate_subject_level(model, loader, criterion, device,
         logits = model(imgs)
         loss = criterion(logits, labels)
         running_loss += loss.detach().item() * bs
-
-        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()  # NC 概率
+        probs = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
         y_prob_img.extend(probs.tolist())
         y_true_img.extend(labels.detach().cpu().numpy().tolist())
-
         paths_this_epoch.extend(paths_all[ptr:ptr+bs]); ptr += bs
 
     epoch_loss = running_loss / max(len(loader.dataset), 1)
@@ -227,45 +282,49 @@ def evaluate_subject_level(model, loader, criterion, device,
     return float(epoch_loss), float(acc), float(auc), float(best_thr)
 
 
-# ----------------- 绘图 -----------------
+# ----------------- Plot utils -----------------
 def plot_curves(history, outdir):
     os.makedirs(outdir, exist_ok=True)
-
-    plt.figure()
-    plt.plot(history["train_loss"], label="train_loss")
-    plt.plot(history["val_loss"],   label="val_loss")
+    plt.figure(); plt.plot(history["train_loss"], label="train_loss"); plt.plot(history["val_loss"], label="val_loss")
     plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.tight_layout()
     plt.savefig(os.path.join(outdir, "loss_curve.png")); plt.close()
 
-    plt.figure()
-    plt.plot(history["train_acc"], label="train_acc")
-    plt.plot(history["val_acc"],   label="val_acc")
+    plt.figure(); plt.plot(history["train_acc"], label="train_acc"); plt.plot(history["val_acc"], label="val_acc")
     if "test_acc" in history and len(history["test_acc"]) == len(history["val_acc"]):
-        plt.plot(history["test_acc"],  label="test_acc", alpha=0.8)
+        plt.plot(history["test_acc"], label="test_acc", alpha=0.8)
     plt.xlabel("epoch"); plt.ylabel("accuracy"); plt.legend(); plt.tight_layout()
     plt.savefig(os.path.join(outdir, "acc_curve.png")); plt.close()
 
-    plt.figure()
-    plt.plot(history["val_auc"],  label="val_auc")
+    plt.figure(); plt.plot(history["val_auc"], label="val_auc")
     if "test_auc" in history and len(history["test_auc"]) == len(history["val_auc"]):
         plt.plot(history["test_auc"], label="test_auc", alpha=0.8)
     plt.xlabel("epoch"); plt.ylabel("AUC"); plt.legend(); plt.tight_layout()
     plt.savefig(os.path.join(outdir, "auc_curve.png")); plt.close()
 
     if "lr" in history and len(history["lr"]) > 0:
-        plt.figure()
-        plt.plot(history["lr"], label="lr")
+        plt.figure(); plt.plot(history["lr"], label="lr")
         plt.xlabel("epoch"); plt.ylabel("learning rate"); plt.legend(); plt.tight_layout()
         plt.savefig(os.path.join(outdir, "lr_curve.png")); plt.close()
 
     if "best_thr" in history and len(history["best_thr"]) > 0:
-        plt.figure()
-        plt.plot(history["best_thr"], label="best_thr (val subject-level)")
+        plt.figure(); plt.plot(history["best_thr"], label="best_thr (val subject-level)")
         plt.xlabel("epoch"); plt.ylabel("threshold"); plt.ylim(0, 1); plt.legend(); plt.tight_layout()
         plt.savefig(os.path.join(outdir, "threshold_curve.png")); plt.close()
 
+    if "wd" in history and len(history["wd"]) > 0:
+        plt.figure(); plt.plot(history["wd"], label="weight_decay")
+        plt.xlabel("epoch"); plt.ylabel("weight_decay"); plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "wd_curve.png")); plt.close()
+    if "ls" in history and len(history["ls"]) > 0:
+        plt.figure(); plt.plot(history["ls"], label="label_smoothing")
+        plt.xlabel("epoch"); plt.ylabel("label_smoothing"); plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "label_smoothing_curve.png")); plt.close()
+    if "dp" in history and len(history["dp"]) > 0:
+        plt.figure(); plt.plot(history["dp"], label="dropout_p")
+        plt.xlabel("epoch"); plt.ylabel("dropout"); plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "dropout_curve.png")); plt.close()
 
-# ----------------- 其他工具 -----------------
+
 def _collect_labels(ds):
     if hasattr(ds, 'targets'):
         return list(map(int, ds.targets))
@@ -285,16 +344,12 @@ def main(args):
     print(f"Using device: {device}")
     set_seed(args.seed)
 
-    # Data
     train_loader, val_loader, test_loader, class_names = get_loaders(
-        data_root=args.data_root,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
+        data_root=args.data_root, img_size=args.img_size,
+        batch_size=args.batch_size, num_workers=args.workers,
         gray=(args.in_channels == 1)
     )
 
-    # Class weights
     labs = _collect_labels(train_loader.dataset)
     class_weights = None
     if labs:
@@ -304,16 +359,13 @@ def main(args):
         class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
         print(f"Class weights -> class0: {w0:.4f}, class1: {w1:.4f}")
 
-    # Model
     model = build_model(in_channels=args.in_channels, height=args.img_size, width=args.img_size).to(device)
 
-    # Loss & Optim
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.02)
 
     decay, no_decay = [], []
     for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
+        if not p.requires_grad: continue
         if p.ndim == 1 or n.endswith(".bias"):
             no_decay.append(p)
         else:
@@ -324,7 +376,6 @@ def main(args):
         lr=args.lr
     )
 
-    # Warmup + Cosine LR
     base_lr = args.lr; min_lr = 1e-6; warmup_epochs = 3
     def compute_lr(epoch):
         if epoch < warmup_epochs:
@@ -334,14 +385,16 @@ def main(args):
         import math
         return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t / T))
 
+    tuner = AutoTuner(model=model, optimizer=optimizer, criterion=criterion,
+                      gap_hi=0.08, gap_lo=0.02, patience=3,
+                      wd_bounds=(1e-4, 5e-2), ls_bounds=(0.0, 0.10), dp_bounds=(0.0, 0.4))
     scaler = GradScaler('cuda')
 
     best_val_auc = -1.0
     best_thr = 0.5
-    history = {"train_loss": [], "val_loss": [],
-               "train_acc": [], "val_acc": [],
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": [],
                "val_auc": [], "test_acc": [], "test_auc": [],
-               "lr": [], "best_thr": []}
+               "lr": [], "best_thr": [], "wd": [], "ls": [], "dp": []}
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -354,20 +407,17 @@ def main(args):
         val_loss, val_acc, val_auc, best_thr_epoch = evaluate_subject_level(
             model, val_loader, criterion, device, search_thresh=True
         )
-
-        _, test_acc, test_auc, _, test_split = evaluate_subject_level_split(
+        test_loss, test_acc, test_auc, _, test_split = evaluate_subject_level_split(
             model, test_loader, criterion, device,
             threshold=best_thr_epoch, search_thresh=False
         )
 
-        # 记录
         history["train_loss"].append(tr_loss); history["val_loss"].append(val_loss)
         history["train_acc"].append(tr_acc);   history["val_acc"].append(val_acc)
         history["val_auc"].append(val_auc)
         history["test_acc"].append(test_acc);  history["test_auc"].append(test_auc)
         history["lr"].append(cur_lr);          history["best_thr"].append(best_thr_epoch)
 
-        # 打印
         print(f"Train Loss: {tr_loss:.4f}, Train Acc: {tr_acc:.4f}")
         print(f"Val   Loss: {val_loss:.4f}, Val   Acc: {val_acc:.4f}, Val AUC: {val_auc:.4f}, BestThr: {best_thr_epoch:.3f}")
         print(f"Test  Acc: {test_acc:.4f}, Test AUC: {test_auc:.4f}")
@@ -378,8 +428,14 @@ def main(args):
         print(f"Recall_AD={test_split['recall_AD']:.4f}, Specificity_NC={test_split['specificity_NC']:.4f}")
         print(f"LR after epoch {epoch+1}: {cur_lr:.6f}")
 
-        # 保存: 以 val_auc 为准
-        if val_auc > best_val_auc + 1e-6:
+        eps = 1e-6
+        improve = (val_auc > best_val_auc + eps)
+        info = tuner.step(tr_acc, val_acc, val_auc, improve=improve)
+        history["wd"].append(info["wd"]); history["ls"].append(info["ls"]); history["dp"].append(info["dp"])
+        print(f"[AutoTuner] wd={info['wd']:.2e} ls={info['ls']:.3f} dp={info['dp']:.2f} "
+              f"gap={info['gap']:.3f} bad_epochs={info['bad_epochs']}")
+
+        if improve:
             best_val_auc = val_auc
             best_thr = best_thr_epoch
             torch.save(
@@ -408,7 +464,7 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, default="ADNI/AD_NC")
-    ap.add_argument("--outdir", type=str, default="runs/adni_gfnet_minimal")
+    ap.add_argument("--outdir", type=str, default="runs/adni_gfnet_notemp")
     ap.add_argument("--img_size", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=16)
