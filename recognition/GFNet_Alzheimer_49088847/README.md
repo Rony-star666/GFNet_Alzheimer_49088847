@@ -69,6 +69,7 @@ python train.py --data_root path/to/ADNI/AD_NC --outdir runs/experiment1 \
 | matplotlib | 3.10.5 | 
 | pillow | 11.0.0 | 
 | tqdm | 4.67.1 |
+- **Reproducibility**: We set a fixed random seed (42) for initialization and data splitting to ensure results are reproducible. The code calls torch.manual_seed, random.seed, and numpy seed to synchronize randomness. For complete determinism, you can additionally set torch.backends.cudnn.deterministic = True and torch.backends.cudnn.benchmark = False, though this may slow down training. All model weights and training logs can be saved to allow result verification. Given the same seed and environment, you should obtain very similar performance (around 0.81 test accuracy). Minor differences may occur due to non-deterministic GPU operations, but these are negligible for overall metrics
 
 ## Results
 After training on the ADNI MRI slices, the GFNet model achieved strong performance in distinguishing AD vs NC:
@@ -78,3 +79,32 @@ Test Accuracy: ~0.81 (81%). This means the model correctly classifies 81% of hel
 ROC AUC: ~0.85–0.88 on the test set. The Area Under the ROC Curve indicates the model’s discrimination capability between AD and NC across all classification thresholds. An AUC in the high 0.8s suggests the model is capturing the separation between classes well (with an AUC of 1.0 being perfect separation).
 
 The training and validation metrics over epochs are shown in the figures below:
+![ConvNeXt Architecture](plot/acc_curve.png)
+
+        Figure 1: Training vs. validation vs test accuracy per epoch.
+ Both training (blue line) and validation accuracy (orange line) improve steadily and converge by around 50–60 epochs. We also plot test accuracy (green dashed line) for reference, which stays slightly below validation, ending at ~81%. The gap between training and validation accuracy is small, indicating minimal overfitting. The model learns to generalize well — training accuracy reaches ~85% while validation plateaus near 80%, suggesting the regularization (dropout, etc.) was effective.
+
+
+![ConvNeXt Architecture](plot/loss_curve.png)
+
+        Figure 2:Training vs. validation loss per epoch.
+The training loss (blue) decreases smoothly over epochs, while validation loss (orange) follows a similar downward trend and stabilizes toward the end of training. There is no significant divergence between training and validation loss, again confirming that the model did not severely overfit. The final validation loss is low, corresponding to confident and mostly correct predictions on the val set.
+
+![ConvNeXt Architecture](plot/auc_curve.png)
+
+        Figure 3:Validation and test ROC AUC per epoch.
+We monitor the AUC on the validation set (orange) each epoch; it climbs to the high 0.8s, indicating improving classification robustness. The best validation AUC was used to select the best model. The test AUC (green) is plotted for reference and remains close to the validation curve, reaching about 0.86–0.87 by the end. High AUC values show the model achieves a good trade-off of sensitivity and specificity for AD detection.
+
+![ConvNeXt Architecture](plot/lr_curve.png)
+
+        Figure 4: Learning rate schedule over epochs.
+This plot illustrates the cosine annealing schedule with an initial warmup. The learning rate quickly ramps up in the first 3 epochs (warmup), hits the base rate (3e-4), then gradually decreases following a cosine decay to a very low rate by epoch 80. This scheduling helps to initially quickly fit the data and later fine-tune and stabilize training, which likely contributed to the smooth convergence of loss.
+
+Overall, the model’s performance is strong: an 81% accuracy and high AUC suggest it is feasible to classify AD from a single MRI slice with reasonable confidence. The training curves show stable training and validation behavior. There is no evidence of severe overfitting, as validation metrics track training metrics closely. The final model can be used to predict Alzheimer’s presence on new MRI scans, potentially assisting in preliminary screening or supporting diagnostic decisions.
+
+## References
+[1] Y. Rao, W. Zhao, B. Liu, P. Zhou, J. Lu, and J. Zhou, “Global Filter Networks for Image Classification,” Advances in Neural Information Processing Systems (NeurIPS), vol. 34, 2021, pp. 980–993. [Online]. 
+Available: https://arxiv.org/abs/2107.00645
+
+### AI Assistants
+[2] use OpenAI ChatGPT5 to improve my code
