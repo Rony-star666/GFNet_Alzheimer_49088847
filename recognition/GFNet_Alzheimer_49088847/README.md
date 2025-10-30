@@ -18,7 +18,7 @@ Resized all images to 224×224 pixels.
 Normalized grayscale intensity values to [−1, 1].
 Applied gamma correction and Gaussian noise for contrast enhancement and data augmentation.
 - **Data Split**:
-Training, validation, and testing sets are divided on a subject-wise basis to prevent data leakage.
+Training, validation, and testing sets are divided on a subject-wise basis to prevent data leakage.Randomly take 10% of the training set as the validation set.
 The dataset is approximately class-balanced to ensure unbiased evaluation.
 ## Usage
 ### Training
